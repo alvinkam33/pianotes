@@ -1,88 +1,96 @@
 import pretty_midi
 import music21 as m21
+import os
+import sys
 
-# Input and output files
-midi_file = "test.wav.midi"
-output_musicxml = f'{midi_file}.musicxml'
-
-# define valid note durations (whole, half, quarter, etc.)
-VALID_DURATIONS = [4.0, 2.0, 1.0, 0.5, 0.25, 0.125, 0.0625]
-MIN_VALID_DURATION = 0.0625  # prevents ultra-short "2048th" notes (causing conversion error)
-
-USER_TEMPO = float(input("Enter the intended tempo (BPM) or 0 to auto-detect: "))
-print("running midi to musicxml conversion")
+# Constants
+VALID_DURATIONS = [4.0, 2.0, 1.0, 0.5, 0.25, 0.125]  # Whole to 16th notes
+DEFAULT_TIME_SIGNATURE = (4, 4)
 
 def round_duration(duration):
     return min(VALID_DURATIONS, key=lambda x: abs(x - duration))
 
-def parse_midi_events(midi_path, user_tempo):
-    midi = pretty_midi.PrettyMIDI(midi_path)
+def group_notes_into_measures(notes, measure_duration):
+    measures = {}
+    for note in notes:
+        start_measure = int(note.start / measure_duration)
+        measures.setdefault(start_measure, []).append(note)
+    return measures
 
-    # extract tempo from user input
-    if user_tempo > 0:
-        tempo = user_tempo
-    else:
-        tempo_changes = midi.get_tempo_changes()
-        tempo = tempo_changes[1][0] if len(tempo_changes[1]) > 0 else 120
+def quantize_notes_in_measure(notes, quarter_note_duration):
+    # Group notes by start time to form chords
+    chords = []
+    chord = []
+    sorted_notes = sorted(notes, key=lambda n: n.start)
+    epsilon = 1e-3  # small threshold to group simultaneous notes
+    for note in sorted_notes:
+        if not chord:
+            chord.append(note)
+        elif abs(note.start - chord[0].start) < epsilon:
+            chord.append(note)
+        else:
+            chords.append(chord)
+            chord = [note]
+    if chord:
+        chords.append(chord)
 
-    notes_by_time = {}
+    quantized = []
+    for i, chord in enumerate(chords):
+        start_time = chord[0].start
+        end_time = min(n.end for n in chord)
+        if i + 1 < len(chords):
+            next_start = chords[i + 1][0].start
+            end_time = min(end_time, next_start)
+        duration_qn = round_duration((end_time - start_time) / quarter_note_duration)
+        quantized.append((start_time, chord, duration_qn))
+    return quantized
 
-    for instrument in midi.instruments:
-        for note in instrument.notes:
-            start_time = note.start
-            end_time = note.end
-            raw_duration = end_time - start_time 
+def create_part(measures, clef, quarter_note_duration, measure_duration):
+    part = m21.stream.Part()
+    part.append(m21.clef.TrebleClef() if clef == 'treble' else m21.clef.BassClef())
 
-            quarter_length = (raw_duration * tempo) / 60.0
-
-            if quarter_length < MIN_VALID_DURATION:
-                quarter_length = MIN_VALID_DURATION
-
-            quarter_length = round_duration(quarter_length)
-
-            if start_time not in notes_by_time:
-                notes_by_time[start_time] = []
-            notes_by_time[start_time].append((note.pitch, quarter_length, note.velocity))
-
-    return notes_by_time, tempo
-
-def fit_notes_to_measures(notes_by_time, tempo):
-    fitted_notes = {}
-    for start_time, notes in notes_by_time.items():
-        fitted_notes[start_time] = []
-        for pitch, duration, velocity in notes:
-            fitted_notes[start_time].append((pitch, duration, velocity))
-
-    return fitted_notes
-
-def construct_musicxml(notes_by_time, tempo, output_xml):
-    score = m21.stream.Score()
-    treble_part = m21.stream.Part()
-    bass_part = m21.stream.Part()
-
-    tempo_mark = m21.tempo.MetronomeMark(number=int(tempo))
-    score.insert(0, tempo_mark)
-
-    for start_time in sorted(notes_by_time.keys()):
-        for pitch, quarter_length, _ in notes_by_time[start_time]:
-            new_note = m21.note.Note(pitch)
-            new_note.quarterLength = quarter_length
-
-            # assign to treble or bass clef
-            if pitch < 60:
-                bass_part.append(new_note)
+    for idx in sorted(measures):
+        m = m21.stream.Measure(number=idx + 1)
+        quantized_chords = quantize_notes_in_measure(measures[idx], quarter_note_duration)
+        for _, chord_notes, dur in quantized_chords:
+            if len(chord_notes) == 1:
+                n = m21.note.Note(chord_notes[0].pitch)
             else:
-                treble_part.append(new_note)
+                n = m21.chord.Chord([note.pitch for note in chord_notes])
+            n.duration = m21.duration.Duration(dur)
+            m.append(n)
+        part.append(m)
+    return part
 
-    treble_part.insert(0, m21.clef.TrebleClef())
-    bass_part.insert(0, m21.clef.BassClef())
+def midi_to_musicxml(midi_path, bpm):
+    midi_data = pretty_midi.PrettyMIDI(midi_path)
+    quarter_note_duration = 60 / bpm
+    measure_duration = DEFAULT_TIME_SIGNATURE[0] * quarter_note_duration
 
-    score.append(treble_part)
-    score.append(bass_part)
+    treble_notes, bass_notes = [], []
+    for instrument in midi_data.instruments:
+        if not instrument.is_drum:
+            for note in instrument.notes:
+                (treble_notes if note.pitch >= 60 else bass_notes).append(note)
 
-    score.write("musicxml", output_xml)
-    print("processed midi to musicxml", output_musicxml)
+    treble_measures = group_notes_into_measures(treble_notes, measure_duration)
+    bass_measures = group_notes_into_measures(bass_notes, measure_duration)
 
-notes_by_time, tempo = parse_midi_events(midi_file, USER_TEMPO)
-fitted_notes = fit_notes_to_measures(notes_by_time, tempo)
-construct_musicxml(fitted_notes, tempo, output_musicxml)
+    score = m21.stream.Score()
+    score.append(m21.tempo.MetronomeMark(number=bpm))
+    score.append(m21.meter.TimeSignature(f"{DEFAULT_TIME_SIGNATURE[0]}/{DEFAULT_TIME_SIGNATURE[1]}"))
+    score.insert(0, create_part(treble_measures, 'treble', quarter_note_duration, measure_duration))
+    score.insert(0, create_part(bass_measures, 'bass', quarter_note_duration, measure_duration))
+
+
+    output_path = f"{os.path.splitext(midi_path)[0]}.musicxml"
+    score.write('musicxml', fp=output_path)
+    print(f"Exported MusicXML to {output_path}")
+    return output_path
+
+# Optional CLI usage
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python script.py <midi_file> <bpm>")
+    else:
+        midi_to_musicxml(sys.argv[1], float(sys.argv[2]))
